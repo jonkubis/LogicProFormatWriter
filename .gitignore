@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+
+# NOTE: logicx/data/ IS committed (the bundled donor seeds — regenerate via bake_seeds.py).
+#       fixtures/ and templates/ ARE committed (donor sessions = source of truth + tests).
+
+# Logic writes a 154 KB thumbnail into every bundle; nothing here reads it.
+**/WindowImage.jpg
