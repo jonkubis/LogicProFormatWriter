@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logicx"
+version = "0.1.0"
+description = "Generate native Logic Pro .logicx sessions from a MIDI + audio files — no Logic required."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Jon Kubis" }]
+keywords = ["logic-pro", "logicx", "daw", "midi", "audio", "beatmap"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Operating System :: MacOS",
+]
+dependencies = []   # pure stdlib at runtime (macOS `afconvert`/`afinfo` are used only to
+                    # decode/normalize compressed or off-format audio in export_beatmap)
+
+[project.scripts]
+logicx = "logicx.projectdata:main"   # CLI: `logicx exportbeatmap <midi> <out> file1 file2 …`
+
+[tool.setuptools]
+packages = ["logicx"]
+
+[tool.setuptools.package-data]
+# the embedded donor SEEDS (regenerate with ../bake_seeds.py — see DONORS.md)
+logicx = ["data/*.seed", "data/*.gz"]
