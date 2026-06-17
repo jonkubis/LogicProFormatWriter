@@ -3809,7 +3809,8 @@ def _probe_sample_rate(path):
 
 
 def export_beatmap(midi_path, audio_files, out_bundle, *, track_template=None, prototype=None,
-                   head_sync=None, names=None, stereo=True, sample_rate=None, verbose=True):
+                   head_sync=None, names=None, stereo=True, sample_rate=None, lossless=False,
+                   verbose=True):
     """★ THE BEATMAP EXPORT (one call): a beatmap MIDI + audio files (wav/mp3/aif/…) →
     a self-contained Logic `.logicx`, no externalities.
 
@@ -3826,7 +3827,10 @@ def export_beatmap(midi_path, audio_files, out_bundle, *, track_template=None, p
                   the bundled one); prototype : any session with ≥1 audio region (default F21).
     sample_rate : project rate; None (default) = match the source files NATIVELY (44100 or
                   48000 — both Logic-validated), else force 44100/48000. Off-rate sources
-                  are resampled. Requires macOS `afconvert` for compressed / off-format inputs."""
+                  are resampled. Requires macOS `afconvert` for compressed / off-format inputs.
+    lossless    : False (default) = WAV media; True = re-encode the stems as Apple Lossless
+                  (ALAC) in `.caf` containers (Logic plays them natively, ~3-4x smaller).
+                  See `alac.convert_bundle_to_alac`."""
     import tempfile
     import shutil
     import plistlib
@@ -3893,6 +3897,9 @@ def export_beatmap(midi_path, audio_files, out_bundle, *, track_template=None, p
     if mm.tempo_map:
         md["BeatsPerMinute"] = float(mm.tempo_map[0][2])
     mdp.write_bytes(plistlib.dumps(md, fmt=plistlib.FMT_BINARY))
+    if lossless:                                             # re-encode stems to Apple Lossless / CAF
+        from .alac import convert_bundle_to_alac
+        summary["alac"] = convert_bundle_to_alac(out_bundle, verbose=False)
     if verbose:
         print(f"wrote {out_bundle}: {len(wavs)} audio tracks @ head-sync tick {sync}")
         for k, v in summary.items():
@@ -4066,8 +4073,9 @@ def main(argv=None):
         return 0
     if argv and argv[0] == "exportbeatmap":
         # exportbeatmap <midi> <out> audio1 audio2 … [--head-sync TICK] [--sample-rate 44100|48000]
-        #               [--mono] [--names a,b,c]
+        #               [--mono] [--alac] [--names a,b,c]
         #   audio = wav/mp3/aif/… (any CoreAudio format; sample rate matches the source by default)
+        #   --alac = re-encode stems as Apple Lossless (.caf), ~3-4x smaller than WAV
         kw = {}
         rest = argv[3:]
         if "--head-sync" in rest:
@@ -4076,6 +4084,8 @@ def main(argv=None):
             i = rest.index("--sample-rate"); kw["sample_rate"] = int(rest[i + 1]); rest = rest[:i] + rest[i + 2:]
         if "--mono" in rest:
             kw["stereo"] = False; rest = [a for a in rest if a != "--mono"]
+        if "--alac" in rest:
+            kw["lossless"] = True; rest = [a for a in rest if a != "--alac"]
         if "--names" in rest:
             i = rest.index("--names"); kw["names"] = rest[i + 1].split(","); rest = rest[:i] + rest[i + 2:]
         export_beatmap(Path(argv[1]), [Path(a) for a in rest], Path(argv[2]), **kw)
