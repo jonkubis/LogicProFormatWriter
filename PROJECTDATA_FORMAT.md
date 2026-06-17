@@ -524,6 +524,43 @@ RE'd from **F4_midiregion**/**F5_region_moved** (empty region @bar1/@bar2) and *
   so identify the region cluster by its region-name qeSM (name@+0x34, e.g. "Inst 1") + the +0x11c field +
   the placement reference — NOT by "no karT".
 
+## 8.6 ALAC / CAF (Apple Lossless) audio (SOLVED + Logic-validated 2026-06-16)
+Logic plays **Apple Lossless (ALAC) in `.caf` containers** natively, ~3-4× smaller than WAV
+(measured 27% on a 7-stem song). RE'd by diffing two control sessions made from IDENTICAL PCM —
+`fixtures/ctl_wav.logicx` (WAV) vs `fixtures/ctl_caf.logicx` (ALAC) — saved by Logic. Of 530
+records only the **`lFuA`** is format-relevant; its WAV and CAF forms are byte-identical except
+**6 descriptor-anchored changes** (everything else that differs between the two controls — the
+`gRuA` region UUID, `OCuA`/`UCuA`/`ivnE`/`karT` channel/track UUIDs, the `gnoS` registry — is
+time-based session identity, since they're independently-saved projects; the `gRuA` region NAME
+is byte-identical, so regions/pool/registry need NO change).
+
+Locate `b"EVAW"` at offset `d`, then:
+
+| # | change | offset | WAV | ALAC/CAF |
+|---|--------|--------|-----|----------|
+| 1 | filename extension | UTF-16LE + ASCII copies | `.wav` | `.caf` |
+| 2 | type flag | `d − 0x1c3` (u8) | `0x01` | `0x11` |
+| 3 | compressed marker | `d − 0x142` (4B) | `00000000` | `"PMOC"` (= `COMP`, reversed) |
+| 4 | descriptor magic | `d + 0x00` (4B) | `EVAW` (WAVE) | `ffac` (caff) |
+| 5 | format const | `d + 0x08` (u32) | `0x2c` | `0x00` |
+| 6 | size field | `d − 0x32` (u32) | on-disk file size | **decoded PCM bytes** (`frames×ch×bytes`) |
+
+frames (`d+0x0c`) / rate (`d+0x14`) / channels (`d+0x18`) / bits (`d+0x1a`) are UNCHANGED (ALAC
+is lossless). Anchors #2/#3 are **descriptor-relative** (verified across 3 fixtures of differing
+filename length: the flag is `0x01` at `EVAW−0x1c3` and the COMP slot `0` at `EVAW−0x142` in all).
+Applying these to `ctl_wav`'s `lFuA` reproduces `ctl_caf`'s `lFuA` **byte-for-byte**.
+
+**The load-bearing insight — size field = DECODED size, not file size** (CAF: 705600 = 176400×2×2;
+the `.caf` file is 134904). This is why ALAC is robust: unlike WAV (§8, where the file-size field
+must equal the on-disk size, so Logic's `LGWV` rewrite would break it), the CAF reference is
+independent of the compressed file. Logic appends a cosmetic **`ovvw`** overview chunk to the `.caf`
+on import (the CAF analog of WAV's `LGWV`) — but since the size field is PCM-based, that rewrite
+can't invalidate the reference, so plain `afconvert -f caff -d alac` output works as-is.
+
+Implemented in **`logicx/alac.py`** (`wav_lfua_to_caf` + `convert_bundle_to_alac`); exposed as
+`export_beatmap(..., lossless=True)` and CLI `exportbeatmap … --alac`. Tests: `test_alac.py`
+(byte-exact vs the controls). Donor recipe: `DONORS.md` → "ALAC control pair".
+
 ## 9. Project sample rate (SOLVED + Logic-validated)
 `MetaData.plist["SampleRate"]` ALONE does NOT set the session rate (Logic ignores it on open). The
 authoritative session rate is in the **`gnoS` payload**:

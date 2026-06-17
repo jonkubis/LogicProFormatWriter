@@ -52,6 +52,8 @@ encodings, the audio-region and MIDI-note layouts, and the track-synthesis delta
   each carrying its own regions, in a single `synthesize_av_region_bundle()` call. No need for a
   per-layout donor session.
 - **Native 44.1 and 48 kHz**, mono or stereo.
+- **Apple Lossless (ALAC/CAF)** — optional `lossless=True` (CLI `--alac`) re-encodes stems to ALAC
+  in `.caf` containers, which Logic plays natively: lossless, typically **3–4× smaller** than WAV.
 - **Self-contained at runtime** — no loose `.logicx` files in the import path (see below).
 - **Stdlib only** at runtime. (macOS `afconvert`/`afinfo` are used *only* to decode/normalize
   off-format audio; conformant WAVs need nothing but Python.)

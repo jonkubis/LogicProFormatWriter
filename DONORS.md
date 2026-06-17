@@ -59,3 +59,12 @@ trims the pre-allocated mixer on re-save — synthesize on the FRESH donor, not 
 2. `python3.12 bake_seeds.py` to re-derive `logicx/data/` (it self-verifies round-trips).
 3. The byte-level meaning of every extracted record is in `PROJECTDATA_FORMAT.md`
    (§10.6–§10.9 for tracks/regions/synthesis, §8/§8.1 for the audio bin).
+
+## Control sessions (test fixtures, NOT seeds)
+
+These don't feed `logicx/data/` — they're Logic-made ground truth for the test suite and the
+format spec. Keep them in `fixtures/`.
+
+| fixture(s) | how to remake in Logic | proves |
+|---|---|---|
+| **ALAC control pair** — `fixtures/ctl_wav.logicx` + `fixtures/ctl_caf.logicx` | Make one short clip as BOTH WAV and ALAC with identical PCM (`afconvert -f caff -d alac control.wav control.caf`). New empty project → drag in `control.caf` → **Save As** `ctl_caf.logicx` (**"copy files into project"**). Repeat with `control.wav` → `ctl_wav.logicx`. | the WAV→ALAC `lFuA` delta (`PROJECTDATA_FORMAT.md` §8.6); `test_alac.py` asserts `wav_lfua_to_caf` reproduces `ctl_caf` **byte-for-byte**. Identical PCM in both → the only non-format diff is per-session UUIDs. |

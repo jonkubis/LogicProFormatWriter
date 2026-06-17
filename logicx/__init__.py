@@ -13,7 +13,7 @@ Quick start:
     from logicx import export_beatmap
     export_beatmap("song.mid", ["drums.mp3", "bass.wav", "vox.aif"], "out.logicx")
 """
-from . import midimap, projectdata
+from . import midimap, projectdata, alac
 from .midimap import MidiMap, parse_file as parse_midi
 from .projectdata import (
     ProjectData, TimeMap, IdGen,
@@ -27,6 +27,8 @@ from .projectdata import (
     # template-driven exporters (tempo/meter/markers + audio/MIDI from donor templates)
     export_logicx, export_all_multi, export_av_multi, export_midi_multi,
 )
+# ALAC / CAF (Apple Lossless) audio — shrink a WAV bundle ~3-4x; Logic plays it natively
+from .alac import convert_bundle_to_alac, wav_lfua_to_caf
 
 __all__ = [
     "export_beatmap", "ProjectData", "TimeMap", "IdGen", "MidiMap", "parse_midi",
@@ -34,5 +36,6 @@ __all__ = [
     "synthesize_instrument_bundle", "synthesize_audio_on_mixed_bundle",
     "synthesize_track_region_bundle", "synthesize_audio_tracks",
     "export_logicx", "export_all_multi", "export_av_multi", "export_midi_multi",
-    "midimap", "projectdata",
+    "convert_bundle_to_alac", "wav_lfua_to_caf",
+    "midimap", "projectdata", "alac",
 ]
