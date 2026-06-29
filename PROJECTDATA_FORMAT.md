@@ -1005,10 +1005,12 @@ self-contained. Built on the §10.8 combine + the map writers.
   the LGWV checksum are COSMETIC for the Project Audio bin; the load-bearing EVAW fields are rate/channels/bits/
   frames (always written from the WAV) + the lFuA file-size match + relative path (§8.1). (`_EVAW_FMT_FIELDS`/
   `_LGWV_FMT_CHECKSUM` are still keyed only by 44100/2/16 & /24, but unknown formats fall back fine.)
-- **Head-sync (MIDI transport).** `midimap` parses System Common/Real-Time messages (the `b>=0xF1` branch):
-  **`0xFA` (Start) = the audio start position**, **`0xFC` (Stop) = the tail**. `mm.head_sync_tick(ppq)` (0xFA →
-  head-sync, falls back to the 1st note-on) / `mm.audio_span(ppq)` → (start, stop). `head_sync=None` auto-reads
-  the 0xFA tick. (`tick` is an ABSOLUTE 960-PPQ position — use `TimeMap.bar_beat_to_tick` for musical positions.)
+- **Head-sync (MIDI marker).** `midimap` reads a **Control Change #119 on channel 16**: **value 127 = the audio
+  start (head)**, **value 0 = the tail**. (Replaces the System Real-Time `0xFA`/`0xFC` it used to read — those
+  break strict external SMF parsers; CC#119 is undefined in the MIDI spec, so it's a safe custom marker, and a
+  normal channel message every parser handles.) `mm.head_sync_tick(ppq)` (the head CC → head-sync, falls back to
+  the 1st note-on) / `mm.audio_span(ppq)` → (start, stop). `head_sync=None` auto-reads the head CC. (`tick` is an
+  ABSOLUTE 960-PPQ position — use `TimeMap.bar_beat_to_tick` for musical positions.)
 
 ### 13.2 ★ The MINIMAL bundle file set (Logic-validated)
 A `.logicx` Logic opens needs only **four things**:

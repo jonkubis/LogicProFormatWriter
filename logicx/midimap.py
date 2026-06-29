@@ -9,7 +9,8 @@ We parse every track fully (delta-times, running status, sysex, meta) so the
 absolute tick of each event is correct, and collect:
   - tempo map : FF 51 03  Set Tempo      -> (tick, us_per_qn, bpm)
   - meter map : FF 58 04  Time Signature -> (tick, num, den, clocks, n32)
-  - markers   : FF 06     Marker         -> (tick, text)   [bonus, for later]
+  - markers   : FF 06     Marker         -> (tick, text)
+  - head/tail : CC#119 ch16 value 127/0  -> start_ticks / stop_ticks (audio head & tail)
 plus the header division (ticks per quarter note).
 
 Tempo in SMF is microseconds per quarter note; BPM = 60_000_000 / us.
@@ -25,6 +26,13 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Audio head/tail markers: MIDI Control Change #119 on channel 16 (0-indexed 15).
+# value 127 = audio START (head), value 0 = audio END (tail). CC#119 is undefined in the
+# MIDI spec (safe custom marker) and is a standard channel message every SMF parser handles
+# — unlike the System Real-Time 0xFA/0xFC it replaces, which strict parsers reject.
+HEAD_TAIL_CC = 119
+HEAD_TAIL_CHANNEL = 15          # MIDI channel 16, 0-indexed
+
 
 @dataclass
 class MidiMap:
@@ -36,14 +44,14 @@ class MidiMap:
     meter_map: list = field(default_factory=list)    # (tick, num, den, clocks, n32)
     markers: list = field(default_factory=list)      # (tick, text)
     notes: list = field(default_factory=list)        # (start, pitch, velocity, length, channel)
-    start_ticks: list = field(default_factory=list)  # MIDI Start (0xFA) positions — head-sync
-    stop_ticks: list = field(default_factory=list)   # MIDI Stop (0xFC) positions — audio tail
+    start_ticks: list = field(default_factory=list)  # audio head positions (CC#119 ch16 v127)
+    stop_ticks: list = field(default_factory=list)   # audio tail positions (CC#119 ch16 v0)
     end_tick: int = 0
 
     def head_sync_tick(self, target_ppq: int = 960):
-        """The audio head-sync position (the FIRST MIDI Start 0xFA), rescaled to
-        `target_ppq`; falls back to the earliest note-on, else None. (Pair with a
-        MIDI Stop 0xFC for the tail — see `stop_ticks`/`audio_span`.)"""
+        """The audio head-sync position (the FIRST head marker — CC#119 ch16 value 127),
+        rescaled to `target_ppq`; falls back to the earliest note-on, else None. (Pair with a
+        tail marker — CC#119 ch16 value 0 — see `stop_ticks`/`audio_span`.)"""
         s = target_ppq / self.division
         if self.start_ticks:
             return round(min(self.start_ticks) * s)
@@ -52,8 +60,8 @@ class MidiMap:
         return None
 
     def audio_span(self, target_ppq: int = 960):
-        """(start, stop) ticks from the first MIDI Start (0xFA) and first MIDI Stop
-        (0xFC), rescaled to `target_ppq`; either is None if absent."""
+        """(start, stop) ticks from the first head marker (CC#119 ch16 v127) and first
+        tail marker (CC#119 ch16 v0), rescaled to `target_ppq`; either is None if absent."""
         s = target_ppq / self.division
         start = round(min(self.start_ticks) * s) if self.start_ticks else None
         stop = round(min(self.stop_ticks) * s) if self.stop_ticks else None
@@ -128,11 +136,7 @@ def _parse_track(data: bytes, start: int, length: int, mm: MidiMap):
             i = j + slen
             running = None
         elif b >= 0xF1:                     # system common (0xF1-0xF6) + real-time (0xF8-0xFE)
-            if b == 0xFA:                   # MIDI Start  -> audio head-sync position
-                mm.start_ticks.append(abstick)
-            elif b == 0xFC:                 # MIDI Stop   -> audio tail position
-                mm.stop_ticks.append(abstick)
-            i += 1 + {0xF1: 1, 0xF2: 2, 0xF3: 1}.get(b, 0)   # consume any data bytes
+            i += 1 + {0xF1: 1, 0xF2: 2, 0xF3: 1}.get(b, 0)   # consume + skip (not used as markers)
             if b <= 0xF6:                   # system common resets running status; real-time doesn't
                 running = None
         else:                               # channel message (+ running status)
@@ -145,7 +149,7 @@ def _parse_track(data: bytes, start: int, length: int, mm: MidiMap):
                 if status is None:
                     raise ValueError(f"running status with no prior status at 0x{i:x}")
             nbytes = 1 if (status & 0xF0) in (0xC0, 0xD0) else 2
-            if nbytes == 2:                     # capture note on/off pairs
+            if nbytes == 2:                     # capture note on/off pairs + the head/tail CC
                 d1, d2 = data[i], data[i + 1]
                 kind, chan = status & 0xF0, status & 0x0F
                 if kind == 0x90 and d2 > 0:                          # note on
@@ -154,6 +158,11 @@ def _parse_track(data: bytes, start: int, length: int, mm: MidiMap):
                     st = active.pop((chan, d1), None)
                     if st is not None:
                         mm.notes.append((st[0], d1, st[1], abstick - st[0], chan))
+                elif kind == 0xB0 and chan == HEAD_TAIL_CHANNEL and d1 == HEAD_TAIL_CC:
+                    if d2 == 127:                                    # CC#119 ch16 v127 -> audio head
+                        mm.start_ticks.append(abstick)
+                    elif d2 == 0:                                    # CC#119 ch16 v0   -> audio tail
+                        mm.stop_ticks.append(abstick)
             i += nbytes
     for (chan, pitch), (start, vel) in active.items():               # close dangling
         mm.notes.append((start, pitch, vel, max(0, abstick - start), chan))
@@ -215,12 +224,13 @@ def build_test_midi() -> bytes:
     cond += _vlq(1920) + b"\xFF\x58\x04" + bytes([3, 2, 24, 8])  # 3/4 after 1 bar
     cond += _vlq(0) + b"\xFF\x51\x03" + (666667).to_bytes(3, "big")  # ~90 BPM
     cond += _vlq(0) + b"\xFF\x2F\x00"
-    # note track: a MIDI Start (head-sync), two Note Ons via running status, a MIDI Stop (tail)
+    # note track: an audio-head marker (CC#119 ch16 v127), a Note On + a running-status Note
+    # Off, an audio-tail marker (CC#119 ch16 v0)
     notes = bytearray()
-    notes += _vlq(0) + b"\xFA"                 # MIDI Start (0xFA) @ tick 0 — head-sync
+    notes += _vlq(0) + b"\xBF\x77\x7F"        # CC#119 ch16 v127 @ tick 0 — audio head
     notes += _vlq(0) + b"\x90\x3C\x64"        # note on C4
     notes += _vlq(480) + b"\x3C\x00"          # running status: note on C4 vel0 (off)
-    notes += _vlq(0) + b"\xFC"                 # MIDI Stop (0xFC) @ tick 480 — tail
+    notes += _vlq(0) + b"\xBF\x77\x00"        # CC#119 ch16 v0 @ tick 480 — audio tail
     notes += _vlq(0) + b"\xFF\x2F\x00"
     hdr = struct.pack(">HHH", 1, 2, div)
     return _chunk(b"MThd", hdr) + _chunk(b"MTrk", bytes(cond)) + _chunk(b"MTrk", bytes(notes))
@@ -251,8 +261,8 @@ def _selftest() -> int:
     check("meter[1]", mm.meter_map[1][:3], (1920, 3, 4))
     check("rescale->960 bar2 tick", mm.rescaled_tempo_map(960)[1][0], 3840)
     check("note survives transport msgs", mm.rescaled_notes(960), [(0, 60, 100, 960)])
-    check("MIDI Start (0xFA) tick", mm.start_ticks, [0])
-    check("MIDI Stop (0xFC) tick", mm.stop_ticks, [480])
+    check("audio head (CC#119 ch16 v127) tick", mm.start_ticks, [0])
+    check("audio tail (CC#119 ch16 v0) tick", mm.stop_ticks, [480])
     check("head_sync_tick(960)", mm.head_sync_tick(960), 0)
     check("audio_span(960)", mm.audio_span(960), (0, 960))
     print("PASS" if ok else "FAIL")

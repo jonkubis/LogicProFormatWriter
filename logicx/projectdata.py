@@ -3820,9 +3820,9 @@ def export_beatmap(midi_path, audio_files, out_bundle, *, track_template=None, p
     applies the tempo/meter/markers; packs all media inside the bundle.
 
     audio_files : 1..~63 paths (wav/mp3/aif/m4a/…); the clip + track take the file's stem.
-    head_sync   : None = the MIDI Start (0xFA) position in the MIDI (the head-sync marker;
-                  falls back to the first note-on); or an explicit 960-PPQ tick (e.g. via
-                  `TimeMap.bar_beat_to_tick`). A MIDI Stop (0xFC) marks the tail (reported).
+    head_sync   : None = the audio-head marker in the MIDI (CC#119 on ch16, value 127; falls
+                  back to the first note-on); or an explicit 960-PPQ tick (e.g. via
+                  `TimeMap.bar_beat_to_tick`). A tail marker (CC#119 ch16 value 0) is reported.
     track_template : a pre-allocated audio-track-synth session (`1 from 64`-style; default
                   the bundled one); prototype : any session with ≥1 audio region (default F21).
     sample_rate : project rate; None (default) = match the source files NATIVELY (44100 or
@@ -3850,7 +3850,7 @@ def export_beatmap(midi_path, audio_files, out_bundle, *, track_template=None, p
 
     mm = midimap.parse_file(midi_path)
     div = mm.division or 960
-    if head_sync is None:                                    # head-sync = MIDI Start (0xFA), else 1st note-on
+    if head_sync is None:                                    # head-sync = CC#119 ch16 v127, else 1st note-on
         sync = mm.head_sync_tick(960)
         sync = 0 if sync is None else sync
     else:

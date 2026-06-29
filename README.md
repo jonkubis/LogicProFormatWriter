@@ -17,7 +17,7 @@ The importable Python package is named **`logicx`**.
 ```python
 from logicx import export_beatmap
 
-# a MIDI (tempo/meter/markers + a MIDI-Start 0xFA head-sync) + audio files -> one .logicx
+# a MIDI (tempo/meter/markers + a CC#119/ch16 head-sync marker) + audio files -> one .logicx
 export_beatmap("song.mid", ["drums.mp3", "bass.wav", "vox.aif"], "out.logicx")
 ```
 
@@ -42,7 +42,7 @@ encodings, the audio-region and MIDI-note layouts, and the track-synthesis delta
 
 ## Features
 
-- **`export_beatmap()`** — the one-call pipeline: a MIDI (tempo/meter/markers + a `0xFA`/`0xFC`
+- **`export_beatmap()`** — the one-call pipeline: a MIDI (tempo/meter/markers + a CC#119/ch16
   head-sync convention) + 1–16 audio files → one self-contained session. Takes `wav` / `mp3` /
   `aif` (compressed/off-format audio is transcoded to the WAV format Logic expects), names tracks
   after the source files, and lines every clip up to the head-sync.
@@ -110,7 +110,7 @@ embedded path matches the original file-path donors.
 logicx/                 the importable package (pip-installable)
   __init__.py           public API: export_beatmap, ProjectData, TimeMap, synthesize_* …
   projectdata.py        the .logicx parser/writer + all synthesis + the CLI (main)
-  midimap.py            stdlib Standard-MIDI-File reader (tempo/meter/markers/notes + 0xFA/0xFC)
+  midimap.py            stdlib Standard-MIDI-File reader (tempo/meter/markers/notes + CC#119 head/tail)
   data/                 ★ generated donor seeds (regenerate via ../bake_seeds.py)
 bake_seeds.py           regenerates logicx/data/ from the donor fixtures   ← reconstitution
 DONORS.md               donor provenance + Logic recipes                    ← reconstitution
