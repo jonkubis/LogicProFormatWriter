@@ -34,6 +34,7 @@ This adds the 36-byte record-header census (§2.1) and **all 31 record types** (
 read/write library layer: `logicx.inspect` (14 decoders + CLI `python3.12 -m logicx.inspect <session>`)
 and `logicx.edit` (round-trip-safe mutators). The whole corpus **round-trips 1293/1293 byte-for-byte**
 — the container/record model is losslessly reimplemented across every version.
+Real projects are cited by letter (session A–E; B2 is a later version of B), not by name.
 
 **Record tag → section index:**
 `gnoS` Song root §21 · `karT` track rows §18 · `qeSM`/`qSvE` sequences §3, §20, §36 · `gRuA` audio
