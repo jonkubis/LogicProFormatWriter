@@ -41,6 +41,10 @@ MIDI = ROOT / "fixtures" / "midi test"
 # --- DONOR FIXTURE MAP (source of truth) — see DONORS.md for how each was made in Logic --
 DONORS = {
     "audio_base": ROOT / "fixtures" / "lots of audio tracks" / "1 from 64 audio tracks.logicx",
+    # XL: same construction at 1000 tracks. Logic writes one gnoS Table-1 registry row per
+    # ALLOCATED channel, so a seed's own allocation is the track ceiling (§10.6.3) — 63 free
+    # slots from the 64 donor, 999 from this one. Used only when a build needs >64 tracks.
+    "audio_base_xl": ROOT / "fixtures" / "lots of audio tracks" / "1 from 1000 audio tracks.logicx",
     "mixed_base": MIDI / "mixed_template.logicx",
     "mixed_1inst": MIDI / "mixed_template + 1 inst.logicx",
     "mixed_2inst": MIDI / "mixed_template + 2 inst.logicx",
@@ -122,7 +126,7 @@ def main():
         raise SystemExit(f"missing donor fixtures {missing} — see DONORS.md to (re)create them in Logic")
 
     # 1) base seeds (the sessions we synthesize onto + assemble bundles from) -------------
-    for name in ("audio_base", "mixed_base"):
+    for name in ("audio_base", "mixed_base", "audio_base_xl"):
         bundle = Path(DONORS[name])
         files = {f: (bundle / f).read_bytes() for f in SEED_FILES if (bundle / f).exists()}
         blob = pack_seed(files)
@@ -156,7 +160,8 @@ def main():
         "infra round-trip failed"
     print(f"  infra (pre-extracted): infra.json.gz  ({len(payload)//1024} KB gz)  "
           f"<- mixed +1/+2 inst, +1 audio, F23, F21")
-    total = sum((DATA / f).stat().st_size for f in ("audio_base.seed", "mixed_base.seed", "infra.json.gz"))
+    total = sum((DATA / f).stat().st_size for f in
+                ("audio_base.seed", "mixed_base.seed", "audio_base_xl.seed", "infra.json.gz"))
     print(f"\nOK — wrote logicx/data/ ({total//1024} KB total). Regenerate any time with this script.")
 
 

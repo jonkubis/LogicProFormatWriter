@@ -1591,7 +1591,32 @@ def _ensure_wav_lgwv(data: bytes) -> bytes:
             sl = a[b * 256 * ch:(b + 1) * 256 * ch]
             mn, mx = (min(sl), max(sl)) if sl else (0, 0)
             peaks += struct.pack("<bb", _i8(mn), _i8(mx))
-    elif bps == 3:                                        # 24-bit
+    elif bps == 3 and _array.array("i").itemsize == 4 and sys.byteorder == "little":
+        # 24-bit, FAST PATH. The obvious per-sample `int.from_bytes` loop (kept below as the
+        # fallback) runs ~4.7 M samples/s, and since 24-bit is the professional norm it
+        # dominates every real export — 2.7 G samples on the first full session tried.
+        # Widening each sample into an int32 lets `min`/`max` run at C speed instead: the
+        # 3 source bytes become the TOP 3 bytes of the int32 (low byte 0), so the value is
+        # exactly `v * 256` with the sign already correct, and `// 256` recovers `v`
+        # exactly. Byte-identical to the loop below, ~14x faster.
+        step = 256 * ch                                   # samples per overview bin
+        total = frames * ch
+        done = 0
+        while done < total:
+            n = min(2048 * step, total - done)             # bounded chunk: caps peak memory
+            raw = pcm[done * 3:(done + n) * 3]
+            buf = bytearray(n * 4)
+            buf[1::4] = raw[0::3]
+            buf[2::4] = raw[1::3]
+            buf[3::4] = raw[2::3]
+            a = _array.array("i")
+            a.frombytes(bytes(buf))
+            for b0 in range(0, n, step):
+                sl = a[b0:b0 + step]
+                mn, mx = (min(sl) // 256, max(sl) // 256) if sl else (0, 0)
+                peaks += struct.pack("<bb", _i8(mn), _i8(mx))
+            done += n
+    elif bps == 3:                                        # 24-bit, portable fallback
         for b in range(bins):
             mn, mx = 0x7fffffff, -0x80000000
             for o in range(b * 256 * ch * 3, min((b + 1) * 256 * ch, frames * ch) * 3, 3):
@@ -1628,11 +1653,17 @@ def _ensure_wav_lgwv(data: bytes) -> bytes:
     return bytes(out)
 
 
-def _build_region_specs(template: "ProjectData", items):
+def _build_region_specs(template: "ProjectData", items, overviews: bool = True):
     """Read each (track, wav, tick) item's wav, ensure it carries a Logic `LGWV`
     overview chunk (so Logic won't rewrite + resize it), and assign its REAL internal
     Media filename (basename, de-duplicated). Region display name = wav stem.
-    Returns (regions, wav_assignments=[(internal_name, content_bytes)], rates)."""
+    Returns (regions, wav_assignments=[(internal_name, content_bytes)], rates).
+
+    `overviews=False` skips the LGWV pass. ONLY safe when the WAVs are about to be
+    replaced — i.e. transcoded to ALAC/CAF, where the `lFuA` size field becomes the
+    DECODED size and the file-size match LGWV exists to protect no longer applies.
+    Generating overviews for files that are then thrown away is pure waste: on a 223-file
+    24-bit session it is over a minute of the export."""
     import wave
     regions, wav_assign, rates, seen = [], [], set(), {}
     for track, wav, tick in items:
@@ -1640,7 +1671,9 @@ def _build_region_specs(template: "ProjectData", items):
         with wave.open(str(wav), "rb") as wf:
             nframes, framerate = wf.getnframes(), wf.getframerate()
             bits, channels = wf.getsampwidth() * 8, wf.getnchannels()
-        content = _ensure_wav_lgwv(wav.read_bytes())     # append LGWV if missing
+        content = wav.read_bytes()
+        if overviews:
+            content = _ensure_wav_lgwv(content)          # append LGWV if missing
         file_size = len(content)                          # post-LGWV size → lFuA
         internal = wav.name                              # real on-disk name
         if internal in seen:                             # de-dup collisions
@@ -1792,6 +1825,25 @@ def _seed_base_pd(name: str) -> "ProjectData":
     return ProjectData.parse(_seed_files(name)["Alternatives/000/ProjectData"])
 
 
+#: Track ceiling of each bundled audio seed. Logic writes one gnoS Table-1 registry row per
+#: ALLOCATED channel (§10.6.3), so a seed's own allocation IS the ceiling — `activate_audio_track`
+#: raises "template exhausted" once the free rows run out. Measured on the donors: the
+#: `1 from 64` base yields 63 free slots, the `1 from 1000` base 999.
+AUDIO_SEED_SLOTS = {"audio_base": 64, "audio_base_xl": 1000}
+AUDIO_SEED_MAX = max(AUDIO_SEED_SLOTS.values())
+
+
+def _audio_seed_for(tracks: int) -> str:
+    """Smallest bundled audio seed that can hold `tracks` tracks.
+
+    The XL seed carries a 1000-slot registry — ~1 MB of ProjectData versus ~250 KB — so it
+    is used only when the build actually needs it, keeping small sessions small.
+    """
+    if tracks > AUDIO_SEED_SLOTS["audio_base"] and (_SEED_DIR / "audio_base_xl.seed").exists():
+        return "audio_base_xl"
+    return "audio_base"
+
+
 def _infra_dec(v):
     import base64
     if isinstance(v, dict):
@@ -1908,7 +1960,8 @@ def _assemble_combine_bundle(template_bundle: Path, out_bundle: Path, out_bytes:
 
 def synthesize_track_region_bundle(track_template_bundle: Path, prototype_bundle: Path,
                                    out_bundle: Path, items, *, seed=None, drummer=True,
-                                   stereo=True, names=None, verbose: bool = True) -> dict:
+                                   stereo=True, names=None, overviews: bool = True,
+                                   verbose: bool = True) -> dict:
     """THE COMBINE (§10.8): synthesize N audio TRACKS *and* their audio REGIONS in
     one call — arbitrary track count AND arbitrary regions, from a minimal template.
 
@@ -1938,14 +1991,15 @@ def synthesize_track_region_bundle(track_template_bundle: Path, prototype_bundle
         raise ValueError(f"refusing to overwrite existing {out_bundle}")
     if not items:
         raise ValueError("no regions given")
-    pd, base_files = _resolve_base(track_template_bundle, "audio_base")
-    have = _audio_track_count(pd)
     want = max(int(t) for t, _, _ in items)
+    # pick the seed by the ceiling this build needs (§10.6.3); an explicit template wins
+    pd, base_files = _resolve_base(track_template_bundle, _audio_seed_for(want))
+    have = _audio_track_count(pd)
     need = max(0, want - have)
     ids = IdGen(seed)
     for _ in range(need):
         activate_audio_track(pd, ids=ids, drummer=drummer)
-    regions, wav_assign, rates = _build_region_specs(None, items)
+    regions, wav_assign, rates = _build_region_specs(None, items, overviews)
     if prototype_bundle is not None:                          # explicit prototype session
         proto = ProjectData.parse((Path(prototype_bundle) / "Alternatives/000/ProjectData").read_bytes())
         pd = ProjectData.synthesize_audio_regions(pd, regions, prototype=proto)
@@ -2623,14 +2677,174 @@ def _synth_find(recs, tag, idx):
     return None, None
 
 
+#: `OCuA` @0x82 on a free strip Logic has not assigned a position to (§10.6.3).
+OCUA_SEQ_UNASSIGNED = 0xFF
+
+
 def _synth_next_strip(recs, T):
-    """Pre-allocated channel strip to activate: zero UUID @0xbd, ordinal @0x82==T."""
-    for r in recs:
-        if (r.tag == b"OCuA" and len(r.raw) >= OCUA_UUID + 16
-                and r.raw[OCUA_UUID:OCUA_UUID + 16] == b"\x00" * 16
-                and r.raw[OCUA_SEQ] == T):
-            return r
-    return None
+    """Pre-allocated channel strip to activate: a strip with a zero UUID @0xbd.
+
+    Logic labels only the FIRST 31 free strips with their position in `@0x82`; every
+    remaining one carries the 0xFF "unassigned" sentinel. Measured on the `1 from 64`
+    base: `@0x2a` (position) runs 1..63, while `@0x82` is 1..31 once each and then 0xFF
+    x32 — identical on the 1000-slot base, so it is a property of how Logic writes the
+    pool, not of its size.
+
+    Matching `@0x82 == T` exactly therefore finds nothing from track 32 onward, and all
+    three callers do `if orec is not None`, so the link was silently skipped and the
+    channel got NO mixer strip (no fader, no routing) while still appearing in the
+    arrange. Try the exact match first — byte-identical behaviour for T <= 31 — then a
+    sentinel strip, then any free strip.
+
+    Only AUDIO strips are eligible. A mixed base pre-allocates both kinds — 63 audio and
+    63 instrument on `mixed_base`, the instrument ones all at seq 0 — and handing an
+    instrument strip to an audio channel makes `_is_instrument_ivne` report that channel
+    as an instrument, which breaks the next `_light_activate_audio` ("cur_max is not an
+    audio channel"). Instrument activation has its own INST_OCUA_CFG search.
+    """
+    free = [r for r in recs if r.tag == b"OCuA" and len(r.raw) >= OCUA_UUID + 16
+            and r.raw[OCUA_UUID:OCUA_UUID + 16] == b"\x00" * 16
+            and r.raw[0x70:0x72] != INST_OCUA_CFG]
+    for want in (T, OCUA_SEQ_UNASSIGNED):
+        for r in free:
+            if r.raw[OCUA_SEQ] == want:
+                return r
+    return free[0] if free else None
+
+
+#: gnoS fields holding the project-start position, RECORD-relative. Logic keeps it in two
+#: domains at once and they must AGREE — setting only some leaves the start unchanged
+#: (verified: any proper subset of these five reads back as bar 1).
+GNOS_START_TICK_OFFS = (0x154, 0x15c, 0x1ac, 0x410)   # 960-PPQ ticks, 38400 == bar 1
+GNOS_START_SAMPLE_OFF = 0x346                          # samples; default 3600 s (01:00:00:00)
+
+
+def set_project_start_bar(pd, bar: int, *, sample_rate: int = 44100, bpm: float = 120.0,
+                          numerator: int = 4, denominator: int = 4) -> int:
+    """Renumber the project so its first bar is `bar` — Logic's *Project Settings ▸ General
+    ▸ Bar position of project start*. Returns the bar set.
+
+    Bar 1 stays anchored to the SMPTE start; a `bar` below 1 moves the project start EARLIER
+    by that many bars, in both the tick and sample domains. Bar numbering is contiguous and
+    **includes bar 0** (bar -2 is three bars before bar 1, not two) — matching Pro Tools, and
+    measured rather than assumed: Logic's own -2 donor shifts by exactly 3 bars' worth.
+
+    `bpm` / `numerator` / `denominator` describe the bar at the START of the project (the
+    bars being added precede bar 1, so the initial tempo and meter govern their length).
+    """
+    grec = next((r for r in pd.records if r.tag == b"gnoS"), None)
+    if grec is None:
+        raise RuntimeError("no gnoS record")
+    delta_bars = int(bar) - 1
+    ticks_per_bar = round(960 * 4 * numerator / denominator)   # 960 PPQ
+    secs_per_bar = 60.0 / float(bpm) * numerator * (4.0 / denominator)
+    g = bytearray(grec.raw)
+    for off in GNOS_START_TICK_OFFS:
+        cur = struct.unpack_from("<i", g, off)[0]
+        struct.pack_into("<i", g, off, cur + delta_bars * ticks_per_bar)
+    cur = struct.unpack_from("<I", g, GNOS_START_SAMPLE_OFF)[0]
+    struct.pack_into("<I", g, GNOS_START_SAMPLE_OFF,
+                     max(0, round(cur + delta_bars * secs_per_bar * sample_rate)))
+    grec.raw = bytes(g)
+    return int(bar)
+
+
+def _gnos_grow_registries(g: bytes, extra: int, ids) -> bytes:
+    """Append `extra` rows to each of the four gnoS per-channel registries.
+
+    They grow together at exactly 80 bytes per pre-allocated channel — 24 + 24 + 16 + 16
+    — measured across Logic's own 15/16/64/1000-slot projects (§10.6.3). The `0x14` tables
+    hold free rows zero-filled; the `0x17` tables carry ids shaped like the ones activation
+    writes. Rows are appended at each table's end and the tables are spliced back-to-front,
+    so offsets that precede a table (notably `GNOS_T1_ROW0`) stay valid.
+    """
+    g = bytearray(g)
+    const_a = bytes(g[GNOS_T1_HDR + 4:GNOS_T1_HDR + 8])
+    const_b = b"\x22\x5c\xf1\x01"
+    shapes = [(0x18, 0, 4, 0x14), (0x18, 0, 4, 0x17), (0x10, 8, 12, 0x14), (0x10, 8, 12, 0x17)]
+    found = []
+    for stride, toff, ioff, tag in shapes:
+        start = _gnos_table_start(g, stride, toff, tag)
+        if start is None:
+            raise RuntimeError(f"gnoS registry (stride 0x{stride:x} tag 0x{tag:x}) not found")
+        n = sum(1 for _ in _synth_walk_rows(g, start, stride, toff, ioff, tag))
+        found.append((start, n, stride, toff, ioff, tag,
+                      _u32(g, start + (n - 1) * stride + ioff)))
+    for start, n, stride, toff, ioff, tag, last_idx in sorted(found, key=lambda t: -t[0]):
+        rows = bytearray()
+        for k in range(1, extra + 1):
+            idx = last_idx + 4 * k
+            if stride == 0x18 and tag == 0x14:
+                rows += struct.pack("<II", 0x14, idx) + b"\x00" * 16
+            elif stride == 0x18:
+                rows += struct.pack("<II", 0x17, idx) + ids.time_low() + const_a + ids.node()
+            elif tag == 0x14:
+                rows += b"\x00" * 8 + struct.pack("<II", 0x14, idx)
+            else:
+                rows += ids.time_low()[::-1] + const_b + struct.pack("<II", 0x17, idx)
+        at = start + n * stride
+        g[at:at] = rows
+    struct.pack_into("<I", g, REC_SIZE_OFF, len(g) - REC_HEADER_SIZE)
+    return bytes(g)
+
+
+def _pool_capacity(pd) -> int:
+    """Free channel slots this base can still host: the smaller of its free gnoS registry
+    rows and its free audio `OCuA` strips — a channel needs one of each."""
+    g = bytearray(next(r for r in pd.records if r.tag == b"gnoS").raw)
+    rows = len(_gnos_rows(g, GNOS_T1_ROW0, GNOS_T1_STRIDE, 0, 4))
+    strips = sum(1 for r in pd.records
+                 if r.tag == b"OCuA" and len(r.raw) >= OCUA_UUID + 16
+                 and r.raw[OCUA_UUID:OCUA_UUID + 16] == b"\x00" * 16
+                 and r.raw[0x70:0x72] != INST_OCUA_CFG)
+    return min(rows, strips)
+
+
+def _grow_pool_if_needed(pd, wanted: int, ids=None) -> int:
+    """Grow the pool so it can host `wanted` new channels. No-op when it already can."""
+    short = wanted - _pool_capacity(pd)
+    return grow_channel_pool(pd, short, ids) if short > 0 else 0
+
+
+def grow_channel_pool(pd, extra: int, ids=None) -> int:
+    """Extend a base's PRE-ALLOCATED channel pool by `extra` slots, in place.
+
+    A seed can only host as many tracks as Logic pre-allocated when the donor was made:
+    `activate_audio_track` needs a free gnoS registry row per channel, and every channel
+    needs a free `OCuA` strip or it ends up with no mixer controls. This grows both, so a
+    base is no longer limited to the donor's own track count — which is what otherwise
+    caps a MIXED (audio + software-instrument) session at 63 synthesized channels, there
+    being no 1000-slot mixed donor.
+
+    Returns the number of slots added. Logic-validated on the mixed base.
+    """
+    if extra <= 0:
+        return 0
+    ids = ids or IdGen()
+    grec = next((r for r in pd.records if r.tag == b"gnoS"), None)
+    if grec is None:
+        raise RuntimeError("no gnoS record")
+    grec.raw = _gnos_grow_registries(grec.raw, extra, ids)
+
+    # clone free AUDIO strips: @0x0c = ordinal<<16, @0x2a = ordinal, @0x82 = unassigned,
+    # UUID @0xbd left zero so `_synth_next_strip` sees them as free.
+    free = [(i, r) for i, r in enumerate(pd.records)
+            if r.tag == b"OCuA" and len(r.raw) >= OCUA_UUID + 16
+            and r.raw[OCUA_UUID:OCUA_UUID + 16] == b"\x00" * 16
+            and r.raw[0x70:0x72] != INST_OCUA_CFG]
+    if not free:
+        raise RuntimeError("no free audio OCuA strip to use as a template")
+    last_pos, template = free[-1]
+    ordinal = _u32(template.raw, 0x0c) >> 16
+    clones = []
+    for k in range(1, extra + 1):
+        b = bytearray(template.raw)
+        struct.pack_into("<I", b, 0x0c, (ordinal + k) << 16)
+        b[0x2a] = (ordinal + k) & 0xFF
+        b[OCUA_SEQ] = OCUA_SEQ_UNASSIGNED
+        clones.append(Record(b"OCuA", bytes(b)))
+    pd.records[last_pos + 1:last_pos + 1] = clones
+    return extra
 
 
 def _set_ocua_stereo(raw, stereo):
@@ -2736,6 +2950,50 @@ def _synth_walk_rows(buf, row0, stride, tag_off, idx_off, tag_val=0x14):
         off += stride
 
 
+def _gnos_table_start(buf, stride, tag_off, tag_val, min_rows=6):
+    """Offset of the gnoS registry table with this row shape, found by scanning for its run.
+
+    gnoS carries four parallel per-channel registries — (stride 0x18, tag 0x14@+0),
+    (0x18, 0x17@+0), (0x10, 0x14@+8), (0x10, 0x17@+8) — which together grow by exactly
+    80 bytes per pre-allocated channel. (stride, tag_off, tag_val) identifies one uniquely.
+    Returns the start of the longest matching run, or None.
+    """
+    best = None
+    off = 0
+    while off + stride <= len(buf):
+        if _u32(buf, off + tag_off) == tag_val:
+            n, p = 0, off
+            while p + stride <= len(buf) and _u32(buf, p + tag_off) == tag_val:
+                n += 1
+                p += stride
+            if n >= min_rows and (best is None or n > best[1]):
+                best = (off, n)
+            off = p
+        else:
+            off += 4
+    return None if best is None else best[0]
+
+
+def _gnos_rows(buf, row0, stride, tag_off, idx_off, tag_val=0x14):
+    """Registry rows as [(offset, idx)], resilient to the seed's size.
+
+    The `GNOS_T*_ROW0` constants point at the FREE region of each table and were calibrated
+    on the 64-slot gnoS. A larger seed grows Table 1 (999 rows on the 1000-slot base), which
+    pushes the later tables past those offsets — `GNOS_T2_ROW0`/`GNOS_T3_ROW0` then land
+    INSIDE Table 1 and the walk silently yields nothing, so the registry never gets written.
+    Try the constant first (byte-identical behaviour on the size it was measured for), and
+    fall back to locating the table by scan. Walking from the table start also returns the
+    fixed low-index rows, which is harmless: every caller looks a row up by index.
+    """
+    rows = list(_synth_walk_rows(buf, row0, stride, tag_off, idx_off, tag_val))
+    if rows:
+        return rows
+    start = _gnos_table_start(buf, stride, tag_off, tag_val)
+    if start is None:
+        return []
+    return list(_synth_walk_rows(buf, start, stride, tag_off, idx_off, tag_val))
+
+
 def _uuid_str(id16):
     return "%08X-%04X-%04X-%04X-%012X" % (
         int.from_bytes(id16[0:4], "big"), int.from_bytes(id16[4:6], "big"),
@@ -2768,12 +3026,12 @@ def activate_audio_track(pd, *, ids=None, reindex=False, drummer=True, stereo=Fa
     new_idx = cur_max + SYNTH_IDX_STRIDE
     slot = new_idx >> 16
 
-    t1_rows = {idx: off for off, idx in _synth_walk_rows(g, GNOS_T1_ROW0, GNOS_T1_STRIDE, 0, 4)}
+    t1_rows = {idx: off for off, idx in _gnos_rows(g, GNOS_T1_ROW0, GNOS_T1_STRIDE, 0, 4)}
     if slot not in t1_rows:
         raise RuntimeError(f"template exhausted at {T} tracks (no free slot 0x{slot:x})")
     const_a = bytes(g[GNOS_T1_HDR + 4:GNOS_T1_HDR + 8])
     const_b = b"\x22\x5c\xf1\x01"
-    for off, idx in _synth_walk_rows(g, GNOS_T2_ROW0, GNOS_T2_STRIDE, 8, 12):
+    for off, idx in _gnos_rows(g, GNOS_T2_ROW0, GNOS_T2_STRIDE, 8, 12):
         if g[off:off + 8] != b"\x00" * 8:
             const_b = bytes(g[off + 4:off + 8])
 
@@ -2785,13 +3043,13 @@ def activate_audio_track(pd, *, ids=None, reindex=False, drummer=True, stereo=Fa
     reg_tl, reg_node = ids.time_low(), ids.node()
     t1_off = t1_rows[slot]
     g[t1_off + 8:t1_off + 24] = reg_tl + const_a + reg_node
-    t2_rows = {idx: off for off, idx in _synth_walk_rows(g, GNOS_T2_ROW0, GNOS_T2_STRIDE, 8, 12)}
+    t2_rows = {idx: off for off, idx in _gnos_rows(g, GNOS_T2_ROW0, GNOS_T2_STRIDE, 8, 12)}
     if slot + 4 in t2_rows:
         o = t2_rows[slot + 4]
         g[o:o + 8] = reg_tl[::-1] + const_b
     # gnoS Table3 running stamps
     for idx in (0x08, 0x0c):
-        for off, ridx in _synth_walk_rows(g, GNOS_T3_ROW0, GNOS_T3_STRIDE, 8, 12, tag_val=0x17):
+        for off, ridx in _gnos_rows(g, GNOS_T3_ROW0, GNOS_T3_STRIDE, 8, 12, tag_val=0x17):
             if ridx == idx:
                 g[off:off + 8] = ids.time_low()[::-1] + const_b
                 break
@@ -3556,7 +3814,7 @@ def synthesize_av_region_bundle(template_bundle, out_bundle, *, instruments=0, a
                                 midi_prototype_bundle=None,
                                 inst_ref1_bundle=None, inst_ref2_bundle=None, audio_ref_bundle=None,
                                 inst_names=None, audio_names=None, stereo=True, seed=None,
-                                drummer=True, verbose=True):
+                                drummer=True, overviews=True, verbose=True):
     """THE UNIFIED av CONTENT CALL (§10.9.2/.3): synthesize `instruments` MIDI tracks +
     `audio` audio tracks onto a minimal mixed template AND place audio REGIONS on the
     audio tracks + MIDI note REGIONS on the instrument tracks — one call, one fresh
@@ -3589,6 +3847,9 @@ def synthesize_av_region_bundle(template_bundle, out_bundle, *, instruments=0, a
         return ProjectData.parse((Path(b) / "Alternatives" / "000" / "ProjectData").read_bytes())
 
     pd, base_files = _resolve_base(template_bundle, "mixed_base")
+    # The mixed seed pre-allocates 63 channels and there is no 1000-slot mixed donor, so
+    # grow its registries + free strips when this build needs more (§10.6.3).
+    _grow_pool_if_needed(pd, instruments + audio, IdGen(seed))
     if instruments:
         inst_infra = (instrument_infrastructure(_pd(inst_ref1_bundle), _pd(inst_ref2_bundle), pd)
                       if inst_ref1_bundle and inst_ref2_bundle else _baked_infra()["instrument_infra"])
@@ -3608,7 +3869,7 @@ def synthesize_av_region_bundle(template_bundle, out_bundle, *, instruments=0, a
             if int(trk) not in ordpos:
                 raise ValueError(f"audio track {trk} out of range (have {len(ordpos)} audio tracks)")
             items.append((ordpos[int(trk)], wav, tick))
-        regions, wav_assign, rates = _build_region_specs(None, items)
+        regions, wav_assign, rates = _build_region_specs(None, items, overviews)
         if prototype_bundle is not None:
             pd = ProjectData.synthesize_audio_regions(pd, regions, prototype=_pd(prototype_bundle))
         else:

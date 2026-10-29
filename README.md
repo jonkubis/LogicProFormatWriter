@@ -53,7 +53,8 @@ encodings, the audio-region and MIDI-note layouts, and the track-synthesis delta
   per-layout donor session.
 - **Native 44.1 and 48 kHz**, mono or stereo.
 - **Apple Lossless (ALAC/CAF)** — optional `lossless=True` (CLI `--alac`) re-encodes stems to ALAC
-  in `.caf` containers, which Logic plays natively: lossless, typically **3–4× smaller** than WAV.
+  in `.caf` containers, which Logic plays natively: lossless. Ratio depends on bit depth —
+  measured **~48% (≈2.1×)** on a 24-bit orchestral session; 16-bit material compresses further.
 - **Self-contained at runtime** — no loose `.logicx` files in the import path (see below).
 - **Stdlib only** at runtime. (macOS `afconvert`/`afinfo` are used *only* to decode/normalize
   off-format audio; conformant WAVs need nothing but Python.)
