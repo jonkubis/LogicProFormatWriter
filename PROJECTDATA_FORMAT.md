@@ -235,6 +235,10 @@ audio track's `qSvE` + grows **`OgnS`** (audio pool) + small `gnoS` edits + the 
   so it equals what Logic produces even if Logic regenerates the cosmetic overview — verified my synthetic
   wavs hit Logic's exact sizes (53084/106108/159132 B). The checksum + exact peak scaling (~×1.0118) are
   cosmetic (Logic recomputes); we use 0 + best-effort peaks.
+  **CORRECTION (2026-10-29, §8.9):** the body is `[u32 frameCount][u32 Mac-epoch (1904) timestamp][int8 min,
+  int8 max per 256-frame bin]` — two signed BYTES per bin, each the bin's minimum and maximum across all
+  channels (the length `8 + 2·ceil(frames/256)` is unchanged). The second word is a time, not a checksum:
+  stems of one format in one project carry values minutes apart (F20's reads 2026, F15's 2017).
 - **🎯 TRUE ROOT CAUSE of the whole bin/selection saga — the gRuA DISPLAY NAME is VARIABLE-LENGTH and the
   gRuA RECORD is SIZED to fit it.** Name = `[u16 len][ASCII name][pad to even]` at gRuA payload +0x4a;
   record size tracks it ('047'→242 B, 'w0'→240 B; the UUID @ ~+0xa4 and everything after SHIFT with the
@@ -248,11 +252,17 @@ audio track's `qSvE` + grows **`OgnS`** (audio pool) + small `gnoS` edits + the 
   any filename, any bit depth.** Audio-bin requirements (#1 path, #2 file-size, #3 EVAW+0x04/+0x08 format
   constants, #4 EVAW+0x4a clear, #5 gRuA resized-to-name, #6 event flag preserved, #7 gRuA UUID preserved,
   #8 OgnS emptied, #9 per-region MneG dropped, #10 WAV has LGWV) are ALL required and all in `projectdata.py`.
+  **CORRECTION (2026-10-29, §8.9):** EVAW+0x08 is not a format constant but the byte offset of the file's
+  first sample — 0x400 in F20's 24-bit WAVs because their data starts at byte 1024, 0x1000 in F15's (data at
+  4096), 0x2C in `ctl_wav`'s 44-byte-header WAV. Logic reads the file's own header: projects carrying the table's
+  value over data elsewhere and projects carrying the true offset both open with every region in the bin. So
+  #3 is not load-bearing for +0x08, and the true offset is what Logic itself writes.
 - **`lFuA` audio-format = the `"EVAW"` (WAVE, reversed) descriptor — patch RELATIVE to it (CORRECTION).**
   Its ABSOLUTE offset **shifts with the UTF-16 filename length**, so the old fixed `+0x1f8/+0x200/+0x206`
   was wrong — it only aligned for the 13-char `ZZAUDIOZZ.wav` (EVAW@+0x1ec); a 7-char `047.wav` puts EVAW
   @+0x1e0, a 6-char `02.wav` @+0x1de. **Always locate `b"EVAW"`** then patch: **frames @EVAW+0x0c (u32),
-  sample-rate @EVAW+0x14 (u32), channels @EVAW+0x18 (u16), bits @EVAW+0x1a (u16)** (EVAW+0x08 ≈ const 0x400).
+  sample-rate @EVAW+0x14 (u32), channels @EVAW+0x18 (u16), bits @EVAW+0x1a (u16)** (EVAW+0x08 = the byte
+  offset of the file's first sample, §8.9 — not the constant 0x400 first read here).
   Consistent across F15/F18/F20/F21. Writer uses `_patch_lfua_evaw()`; this also hardened the single-region
   path (previously correct only by luck of the 13-char internal name).
 - **`OgnS`** audio-pool = an `NSKeyedArchiver` bplist (decodable/constructible with plistlib UID):
@@ -557,9 +567,51 @@ independent of the compressed file. Logic appends a cosmetic **`ovvw`** overview
 on import (the CAF analog of WAV's `LGWV`) — but since the size field is PCM-based, that rewrite
 can't invalidate the reference, so plain `afconvert -f caff -d alac` output works as-is.
 
+**The `ovvw` chunk (measured 2026-10-29):** body `[u32 BE 1][u32 BE 256]`, then per 256-frame bin the
+minimum and maximum as big-endian 16-bit values whose low byte is always 0 — `LGWV`'s signed-byte peaks
+shifted up 8. All 690 bins of `ctl_caf`'s `ovvw` equal `ctl_wav`'s `LGWV` bins, and no 24-bit ALAC file in a
+1,309-record corpus has a non-zero low byte. Length `8 + 4·ceil(frames/256)`, mono or stereo. A writer that
+adds it itself spares Logic the overview on first open. Change #5 is the WAV's first-sample offset (§8.9:
+`ctl_wav` has a 44-byte header, so 0x2C) becoming 0, since ALAC has no fixed offset.
+
+**Known gap in `convert_bundle_to_alac`:** it leaves `MetaData.plist`'s `AudioFiles` naming the `.wav` files
+it replaced; Logic's own `ctl_caf` lists `Audio Files/control.caf`. Logic opens the bundle either way.
+
 Implemented in **`logicx/alac.py`** (`wav_lfua_to_caf` + `convert_bundle_to_alac`); exposed as
 `export_beatmap(..., lossless=True)` and CLI `exportbeatmap … --alac`. Tests: `test_alac.py`
 (byte-exact vs the controls). Donor recipe: `DONORS.md` → "ALAC control pair".
+
+## 8.9 Audio files by container — WAV, AIFF, CAF (measured + Logic-validated 2026-10-29)
+Measured on every `.logicx` on Jon's Mac — 2,824 bundles, 1,108 with audio, 77,262 `lFuA` records of a
+known container and codec, saved by Logic 10.0 to 11.2.2 — reading each record's file where it still
+exists. Offsets are from the descriptor's container tag at `d`: `EVAW` (WAVE), `FFIA` (AIFF and AIFC alike)
+or `ffac` (CAF). **Logic-validated:** projects written with every field below — WAV copied and encoded at 16
+and 32-bit float, AIFF at 24 and AIFC at 32-bit float, ALAC at 24 and 16, mono and stereo, one resampled to
+44.1 kHz — open in Logic with every file in the Project Audio bin.
+
+| field | offset | what Logic writes |
+|---|---|---|
+| container tag | `d+0x00` | `EVAW`, `FFIA` or `ffac`; float AIFC keeps `FFIA` |
+| first sample's offset | `d+0x08` (u32) | the byte offset of the file's first sample, on all 40,037 records checked against their files: 39,968 AIFF (`SSND` body + 8 + its offset field), 61 float WAV (`data` body), 8 PCM CAF (`data` body + 4, past the edit count). 0 for ALAC (1,309 of 1,309). |
+| codec tag | `d−0x142` (4 B) | 0 for integer PCM (WAV, AIFF); u32 **3** for 32-bit float WAV, the WAVE format tag (108 of 108); `23lf` (`fl32`) for float AIFC; `PMOC` for ALAC; `mcpl` (`lpcm`) for PCM in a CAF |
+| type flags | `d−0x1c3` (u8) | bit 0x10 marks compression: set on 1,302 of 1,309 ALAC records and on no PCM record (PCM CAFs carry 0x00 or 0x01 like WAV and AIFF) |
+| float byte | `d−0x3d` (u8) | 2 on every float record (114 of 114); 0 on 77,064 of the 77,148 integer and ALAC records (1 on 83 24-bit ones) |
+| channel byte | `d−0x38` (u8) | the channel count: 1 on 56,081 of 56,100 mono records, 2 on all 21,126 stereo ones (`d−0x37` is 0 or 0x3C) |
+| size | `d−0x32` (u32) | the file's on-disk size, overview chunk included, for every PCM container (AIFF 38,801 of 39,962; float WAV 44 of 61; PCM CAF 7 of 8); the DECODED size `frames×channels×bits/8` for ALAC (1,309 of 1,309; 24-bit counts 3 bytes) |
+
+**Overview chunks, one per container.** WAV and AIFF carry `LGWV`, body `[u32 frames][u32 Mac-epoch
+timestamp][int8 min, int8 max per 256-frame bin]`; in AIFF the two header words are big-endian like every
+AIFF field (frames equal `COMM`'s), and the `FORM` size covers the chunk. CAF carries `ovvw` (§8.6). The
+peaks follow no single rule exactly on real music: an import overview fits truncation toward zero (96.5% of
+`ctl_wav`'s bins), Logic's recorded takes fit floor better (90–98%), float files neither (≤54%). They only
+draw the waveform; truncation, floats scaled by 128, reproduces an import closely.
+
+**What the writer here leaves at the template's.** `projectdata.py` sets +0x08 from a two-entry table
+(`44100/2/16` → 0x2C, `44100/2/24` → 0x400) and otherwise keeps the template's, and keeps the template's
+channel byte (2) for mono files: a 24-bit stem whose data starts at byte 750 is recorded at 1024, a mono file
+as stereo. Logic tolerates both (it reads the file's own header), but the values above are what it writes.
+Logic's own fixtures agree: F15 (16-bit, data at 4096) carries 0x1000, F20 (24-bit, data at 1024) 0x400,
+`ctl_wav` (16-bit, 44-byte header) 0x2C; the library-written `TEST_exportall_multi` carries 0x400 over data at 44.
 
 ## 9. Project sample rate (SOLVED + Logic-validated)
 `MetaData.plist["SampleRate"]` ALONE does NOT set the session rate (Logic ignores it on open). The
@@ -573,6 +625,12 @@ Table currently covers 44100/48000 (the common beatmapping rates); high rates wo
 +0x11e and likely use a different field. Writer: `set_project_sample_rate(rate)`, auto-applied in the audio
 export to match the wav. (Note: a 48k file in a 48k project on a 44.1k interface plays correctly via output
 resampling; a 48k file in a 44.1k project plays slow — Logic doesn't resample files on playback.)
+
+**Corpus check (2026-10-29):** all 2,824 projects on Jon's Mac are 44.1 or 48 kHz, so the u16 rule (rate +
+15,660) is unconfirmed beyond them and cannot hold 88,200 or 96,000; a Logic-saved empty project at each rate
+would settle it. The u16s match the rate in every one of them. The byte at +0xDF is not a rate: it takes 14
+values at 44.1 kHz (0, 3, 4, 2, 0x13, …) and 0, 3, 4 or 0x16 at 48 kHz. Patching it is harmless; the u16s
+carry the rate.
 
 ---
 
